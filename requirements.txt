@@ -1,0 +1,5 @@
+anthropic
+httpx
+pyyaml
+beautifulsoup4
+streamlit
