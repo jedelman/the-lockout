@@ -1,0 +1,15 @@
+pieces:
+
+  - id: why-your-city-doesnt-work
+    status: pending
+    url: https://power-explained.jason-edelman.org/why-your-city-doesnt-work.html
+    title: "Why Your City Doesn't Work (and Why It's Not an Accident)"
+    platforms: [bluesky, linkedin]
+    output_path: output/why-your-city-doesnt-work.md
+
+  - id: hardin-was-wrong
+    status: pending
+    url: https://power-explained.jason-edelman.org/hardin-was-wrong.html
+    title: "Hardin Was Wrong"
+    platforms: [bluesky, linkedin]
+    output_path: output/hardin-was-wrong.md
