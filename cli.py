@@ -3,7 +3,8 @@
 cli.py — Entry point for the Power Explained social media content producer.
 
 Usage:
-  python cli.py --source URL_OR_PATH --platform [bluesky|linkedin|all]
+  python cli.py --source URL_OR_PATH
+                --platform [bluesky|threads|linkedin|instagram|all]
                 [--piece "Title"] [--queue]
 
 Examples:
@@ -38,13 +39,22 @@ def run_single(
     print(f"[cli] Argument extracted: {argument.get('thesis', '(no thesis)')}")
 
     piece_title = title or argument.get("title", "Untitled")
-    posts_by_platform: dict[str, list[str]] = {}
+    posts_by_platform: dict = {}
 
     for platform in platforms:
         print(f"[cli] Step 2: generating {platform} posts…")
-        posts = producer.generate_posts(argument, platform, framework_context, source_url=source)
-        posts_by_platform[platform] = posts
-        print(f"[cli] {platform}: {len(posts)} post(s) generated")
+        if platform == "instagram":
+            result = producer.generate_instagram_slideshow(
+                argument, framework_context, source_url=source
+            )
+            posts_by_platform[platform] = result
+            print(f"[cli] instagram: {len(result.get('slides', []))} slide(s) generated")
+        else:
+            posts = producer.generate_posts(
+                argument, platform, framework_context, source_url=source
+            )
+            posts_by_platform[platform] = posts
+            print(f"[cli] {platform}: {len(posts)} post(s) generated")
 
     today = date.today().isoformat()
     return producer.format_output(piece_title, argument, posts_by_platform, today)
@@ -64,7 +74,7 @@ def main() -> None:
     parser.add_argument("--source", help="URL or path to the source piece")
     parser.add_argument(
         "--platform",
-        choices=["bluesky", "linkedin", "all"],
+        choices=["bluesky", "threads", "linkedin", "instagram", "all"],
         default="all",
         help="Target platform(s) (default: all)",
     )
@@ -139,7 +149,8 @@ def main() -> None:
 
     else:
         # Single source mode
-        platforms = ["bluesky", "linkedin"] if args.platform == "all" else [args.platform]
+        all_platforms = ["bluesky", "threads", "linkedin", "instagram"]
+        platforms = all_platforms if args.platform == "all" else [args.platform]
 
         content = run_single(
             source=args.source,

@@ -4,6 +4,7 @@ producer.py — Two-step social media content generation for Power Explained.
 Step 1: extract_argument — forces the model to articulate the argument structure
         before writing any posts, preventing paraphrase mode.
 Step 2: generate_posts — writes platform-specific posts from the argument structure.
+        generate_instagram_slideshow — builds a slide manifest with Wikimedia images.
 """
 
 import json
@@ -14,6 +15,7 @@ import anthropic
 MODEL = "claude-opus-4-6"
 
 FRAMEWORK_URL = "https://power-explained.jason-edelman.org/agent-context.html"
+WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 
 FRAMEWORK_FALLBACK = """
 The commons framework analyzes power through the lens of enclosure and commoning.
@@ -86,6 +88,19 @@ Format rules:
 
 Output: a JSON array of strings, one string per post. No other text."""
 
+THREADS_INSTRUCTIONS = """Write a Threads thread of 4–6 posts about this piece.
+
+Format rules:
+- Post 1: the hook. One claim, stated plainly. No "Did you know." No thread labels.
+  No rhetorical questions. Assert the argument.
+- Posts 2–N: the argument, one move at a time. Each post must stand alone if
+  read out of context.
+- Final post: the commons alternative. Where is it being built right now?
+  Include the source URL from the argument structure if available.
+- Hard limit: 500 characters per post. Use the extra room for precision, not padding.
+
+Output: a JSON array of strings, one string per post. No other text."""
+
 LINKEDIN_INSTRUCTIONS = """Write a single LinkedIn post about this piece.
 
 Format rules:
@@ -99,6 +114,31 @@ Format rules:
 Output: a single JSON string containing the full post text, paragraphs separated
 by blank lines (\\n\\n). No other text."""
 
+INSTAGRAM_INSTRUCTIONS = """Write an Instagram carousel (slideshow) for this piece.
+
+Format rules:
+- 5–7 slides total.
+- Slide 1: the hook. A short, assertive claim (15–25 words). No questions. No teasers.
+- Slides 2–(N-1): one analytical move per slide. Short enough to read at a glance
+  (15–30 words each). Each must stand alone.
+- Final slide: the commons alternative. What is already being built. End with
+  "via power-explained.jason-edelman.org" or the source URL if provided.
+- For each slide, provide an image_query: 3–5 words for searching Wikimedia Commons.
+  Think documentary and factual — urban infrastructure, policy documents, community
+  meetings, historical photographs. No stock-photo language ("diverse team", "handshake").
+- Caption (goes in the Instagram caption field, not on a slide): 2–3 sentences.
+  Makes the argument in full. Ends with "Link in bio." No hashtags.
+
+Output as a JSON object with this exact shape:
+{
+  "slides": [
+    {"text": "slide overlay text", "image_query": "wikimedia search terms"},
+    ...
+  ],
+  "caption": "Post caption text. Link in bio."
+}
+No other text outside the JSON object."""
+
 
 def fetch_framework_context() -> str:
     """Fetch the commons framework context from the live URL.
@@ -108,7 +148,6 @@ def fetch_framework_context() -> str:
         response.raise_for_status()
         html = response.text
 
-        # Extract text content of #context-content
         try:
             from bs4 import BeautifulSoup
             soup = BeautifulSoup(html, "html.parser")
@@ -118,7 +157,6 @@ def fetch_framework_context() -> str:
         except ImportError:
             pass
 
-        # Fallback: strip all tags with regex if bs4 not available
         stripped = re.sub(r"<[^>]+>", " ", html)
         stripped = re.sub(r"\s+", " ", stripped).strip()
         return stripped
@@ -142,7 +180,6 @@ def fetch_source_text(url_or_path: str) -> str:
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
-        # Remove script/style elements
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
         return soup.get_text(separator="\n", strip=True)
@@ -153,41 +190,70 @@ def fetch_source_text(url_or_path: str) -> str:
     return re.sub(r"\s+", " ", stripped).strip()
 
 
+def search_wikimedia(query: str) -> str | None:
+    """Search Wikimedia Commons for a documentary image matching the query.
+
+    Returns the direct image URL or None if nothing is found / the request fails.
+    Uses the generator search API to resolve filename → URL in a single call.
+    """
+    try:
+        r = httpx.get(
+            WIKIMEDIA_API,
+            params={
+                "action": "query",
+                "generator": "search",
+                "gsrsearch": query,
+                "gsrnamespace": 6,  # File namespace only
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "format": "json",
+                "gsrlimit": 1,
+            },
+            timeout=10,
+            headers={"User-Agent": "power-explained-producer/1.0"},
+        )
+        r.raise_for_status()
+        pages = r.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            imageinfo = page.get("imageinfo", [])
+            if imageinfo:
+                return imageinfo[0].get("url")
+    except Exception as e:
+        print(f"[producer] Wikimedia search failed for '{query}': {e}")
+    return None
+
+
+def _call_model(system: str, user_content: str) -> str:
+    """Shared streaming call to the model. Returns the raw text block."""
+    client = anthropic.Anthropic()
+    with client.messages.stream(
+        model=MODEL,
+        max_tokens=4096,
+        thinking={"type": "adaptive"},
+        system=system,
+        messages=[{"role": "user", "content": user_content}],
+    ) as stream:
+        final = stream.get_final_message()
+
+    raw = next((b.text for b in final.content if b.type == "text"), "")
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[^\n]*\n", "", raw)
+        raw = re.sub(r"\n```$", "", raw)
+    return raw
+
+
 def extract_argument(source_text: str, framework_context: str) -> dict:
     """Step 1: Force the model to articulate the argument structure.
 
     Returns a dict with keys:
       title, thesis, enclosure_move, commons_alternative, key_moves, risks
     """
-    client = anthropic.Anthropic()
-
     system = f"{STEP1_SYSTEM}\n\nCommons framework context:\n\n{framework_context}"
-
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
+    raw = _call_model(
         system=system,
-        messages=[
-            {
-                "role": "user",
-                "content": f"Extract the argument structure from this piece:\n\n{source_text}",
-            }
-        ],
-    ) as stream:
-        final = stream.get_final_message()
-
-    raw = next(
-        (b.text for b in final.content if b.type == "text"),
-        "",
+        user_content=f"Extract the argument structure from this piece:\n\n{source_text}",
     )
-
-    # Strip markdown code fences if present
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[^\n]*\n", "", raw)
-        raw = re.sub(r"\n```$", "", raw)
-
     return json.loads(raw)
 
 
@@ -199,47 +265,38 @@ def generate_posts(
 ) -> list[str]:
     """Step 2: Write platform-specific posts from the argument structure.
 
-    Returns a list of post strings (Bluesky) or a single-element list (LinkedIn).
+    Handles bluesky, threads, and linkedin.
+    Returns a list of post strings (bluesky/threads) or a single-element list (linkedin).
+    For instagram use generate_instagram_slideshow() instead.
     """
-    client = anthropic.Anthropic()
+    platform_labels = {
+        "bluesky": "Bluesky thread",
+        "threads": "Threads thread",
+        "linkedin": "LinkedIn",
+    }
+    instructions_map = {
+        "bluesky": BLUESKY_INSTRUCTIONS,
+        "threads": THREADS_INSTRUCTIONS,
+        "linkedin": LINKEDIN_INSTRUCTIONS,
+    }
 
-    platform_label = "Bluesky thread" if platform == "bluesky" else "LinkedIn"
+    platform_label = platform_labels.get(platform, platform)
     system = (
         STEP2_SYSTEM_TEMPLATE.format(platform=platform_label)
         + f"\n\nCommons framework context:\n\n{framework_context}"
     )
 
-    instructions = BLUESKY_INSTRUCTIONS if platform == "bluesky" else LINKEDIN_INSTRUCTIONS
-
-    # Inject source URL into argument if provided
     arg_for_prompt = dict(argument)
     if source_url:
         arg_for_prompt["source_url"] = source_url
 
+    instructions = instructions_map[platform]
     user_content = (
         f"{instructions}\n\nArgument structure:\n\n"
         f"{json.dumps(arg_for_prompt, indent=2)}"
     )
 
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=4096,
-        thinking={"type": "adaptive"},
-        system=system,
-        messages=[{"role": "user", "content": user_content}],
-    ) as stream:
-        final = stream.get_final_message()
-
-    raw = next(
-        (b.text for b in final.content if b.type == "text"),
-        "",
-    )
-
-    raw = raw.strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[^\n]*\n", "", raw)
-        raw = re.sub(r"\n```$", "", raw)
-
+    raw = _call_model(system=system, user_content=user_content)
     parsed = json.loads(raw)
 
     if isinstance(parsed, list):
@@ -247,28 +304,104 @@ def generate_posts(
     return [str(parsed)]
 
 
+def generate_instagram_slideshow(
+    argument: dict,
+    framework_context: str,
+    source_url: str = "",
+) -> dict:
+    """Step 2 (Instagram variant): Generate a slide manifest with Wikimedia images.
+
+    Returns a dict:
+    {
+        "slides": [
+            {
+                "text": "...",
+                "image_query": "...",
+                "image_url": "https://... or None"
+            },
+            ...
+        ],
+        "caption": "..."
+    }
+    """
+    system = (
+        STEP2_SYSTEM_TEMPLATE.format(platform="Instagram carousel")
+        + f"\n\nCommons framework context:\n\n{framework_context}"
+    )
+
+    arg_for_prompt = dict(argument)
+    if source_url:
+        arg_for_prompt["source_url"] = source_url
+
+    user_content = (
+        f"{INSTAGRAM_INSTRUCTIONS}\n\nArgument structure:\n\n"
+        f"{json.dumps(arg_for_prompt, indent=2)}"
+    )
+
+    raw = _call_model(system=system, user_content=user_content)
+    manifest = json.loads(raw)
+
+    # Resolve each slide's image_query to a Wikimedia URL
+    for slide in manifest.get("slides", []):
+        query = slide.get("image_query", "")
+        print(f"[producer] Wikimedia search: '{query}'")
+        slide["image_url"] = search_wikimedia(query) if query else None
+
+    return manifest
+
+
 def format_output(
     title: str,
     argument: dict,
-    posts_by_platform: dict[str, list[str]],
+    posts_by_platform: dict,
     date_str: str,
 ) -> str:
-    """Format the full markdown output for a piece."""
+    """Format the full markdown output for a piece.
+
+    posts_by_platform values are:
+      - list[str] for bluesky, threads, linkedin
+      - dict (slideshow manifest) for instagram
+    """
     lines = [f"# {title} — Generated {date_str}", ""]
 
     lines += ["## Argument extraction", ""]
     lines += ["```json", json.dumps(argument, indent=2), "```", ""]
 
-    for platform, posts in posts_by_platform.items():
+    for platform, content in posts_by_platform.items():
         if platform == "bluesky":
             lines += ["## Bluesky thread", ""]
-            for i, post in enumerate(posts, 1):
+            for i, post in enumerate(content, 1):
                 lines.append(f"{i}. {post}")
             lines.append("")
+
+        elif platform == "threads":
+            lines += ["## Threads thread", ""]
+            for i, post in enumerate(content, 1):
+                lines.append(f"{i}. {post}")
+            lines.append("")
+
         elif platform == "linkedin":
             lines += ["## LinkedIn post", ""]
-            lines += posts
+            lines += content
             lines.append("")
+
+        elif platform == "instagram":
+            lines += ["## Instagram slideshow", ""]
+            slides = content.get("slides", [])
+            for i, slide in enumerate(slides, 1):
+                lines.append(f"### Slide {i}")
+                lines.append(f"**Text:** {slide['text']}")
+                img_url = slide.get("image_url")
+                query = slide.get("image_query", "")
+                if img_url:
+                    lines.append(f"**Image:** {img_url}")
+                    lines.append(f"**Query used:** {query}")
+                else:
+                    lines.append(f"**Image:** *not found — query: '{query}'*")
+                lines.append("")
+            caption = content.get("caption", "")
+            if caption:
+                lines += ["### Caption", "", caption, ""]
 
     lines.append("---")
     lines.append("*Review before posting. Verify any flagged claims.*")
