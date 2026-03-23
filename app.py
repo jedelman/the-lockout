@@ -63,7 +63,7 @@ with st.spinner("Fetching source…"):
         st.error(f"Could not fetch source: {e}")
         st.stop()
 
-with st.spinner("Step 1 — extracting argument structure…"):
+with st.spinner("Step 1 — extracting argument and claims…"):
     try:
         argument = producer.extract_argument(source_text, framework_context)
     except Exception as e:
@@ -71,24 +71,59 @@ with st.spinner("Step 1 — extracting argument structure…"):
         st.stop()
 
 piece_title = argument.get("title", "Untitled")
-
-st.success(f"**{piece_title}** — argument extracted")
+st.success(f"**{piece_title}** — {len(argument.get('claims', []))} claims extracted")
 
 with st.expander("Argument structure"):
-    st.json(argument)
+    st.json({k: v for k, v in argument.items() if k != "claims"})
 
-# Step 2 — generate per platform
+with st.expander(f"Claims ({len(argument.get('claims', []))} extracted)"):
+    st.json(argument.get("claims", []))
+
+# Step 2 — adversary review
+with st.spinner("Step 2 — adversary review…"):
+    try:
+        review = producer.adversary_review(argument)
+        cleared = producer.build_cleared_argument(argument, review)
+    except Exception as e:
+        st.error(f"Adversary review failed: {e}")
+        st.stop()
+
+dropped = cleared.get("high_risk_dropped", [])
+passed = len(cleared.get("claims", []))
+credibility = review.get("overall_credibility", "?")
+
+if dropped:
+    st.warning(
+        f"**Adversary dropped {len(dropped)} high-risk claims.** "
+        f"{passed} cleared. Overall credibility: {credibility}"
+    )
+else:
+    st.success(f"**Adversary: all {passed} claims cleared.** Credibility: {credibility}")
+
+if review.get("biggest_risk"):
+    st.info(f"**Biggest risk flagged:** {review['biggest_risk']}")
+
+with st.expander("Adversary review detail"):
+    st.json(review)
+
+if dropped:
+    with st.expander(f"Dropped claims ({len(dropped)})"):
+        for d in dropped:
+            concern = d.get('concern', '')
+            st.markdown(f"- ~~{d['text']}~~  \n  *{concern}*")
+
+# Step 3 — generate per platform
 posts_by_platform: dict = {}
 for platform in platforms:
-    with st.spinner(f"Step 2 — generating {platform}…"):
+    with st.spinner(f"Step 3 — generating {platform}…"):
         try:
             if platform == "instagram":
                 posts_by_platform[platform] = producer.generate_instagram_slideshow(
-                    argument, framework_context, source_url=source
+                    cleared, framework_context, source_url=source
                 )
             else:
                 posts_by_platform[platform] = producer.generate_posts(
-                    argument, platform, framework_context, source_url=source
+                    cleared, platform, framework_context, source_url=source
                 )
         except Exception as e:
             st.error(f"{platform} generation failed: {e}")
@@ -166,7 +201,7 @@ for tab, platform in zip(tabs, platforms):
 
 st.markdown("---")
 today = date.today().isoformat()
-full_output = producer.format_output(piece_title, argument, posts_by_platform, today)
+full_output = producer.format_output(piece_title, argument, review, cleared, posts_by_platform, today)
 st.download_button(
     label="Download full output (.md)",
     data=full_output,

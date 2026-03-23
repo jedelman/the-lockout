@@ -34,30 +34,43 @@ def run_single(
     print(f"[cli] Fetching source: {source}")
     source_text = producer.fetch_source_text(source)
 
-    print("[cli] Step 1: extracting argument…")
+    print("[cli] Step 1: extracting argument and claims…")
     argument = producer.extract_argument(source_text, framework_context)
     print(f"[cli] Argument extracted: {argument.get('thesis', '(no thesis)')}")
+    print(f"[cli] Claims extracted: {len(argument.get('claims', []))}")
+
+    print("[cli] Step 2: adversary review…")
+    review = producer.adversary_review(argument)
+    cleared = producer.build_cleared_argument(argument, review)
+    dropped = len(cleared.get("high_risk_dropped", []))
+    passed = len(cleared.get("claims", []))
+    print(f"[cli] Adversary: {dropped} claims dropped, {passed} cleared")
+    print(f"[cli] Overall credibility: {review.get('overall_credibility', '?')}")
+    if review.get("biggest_risk"):
+        print(f"[cli] Biggest risk: {review['biggest_risk']}")
 
     piece_title = title or argument.get("title", "Untitled")
     posts_by_platform: dict = {}
 
     for platform in platforms:
-        print(f"[cli] Step 2: generating {platform} posts…")
+        print(f"[cli] Step 3: generating {platform} posts…")
         if platform == "instagram":
             result = producer.generate_instagram_slideshow(
-                argument, framework_context, source_url=source
+                cleared, framework_context, source_url=source
             )
             posts_by_platform[platform] = result
             print(f"[cli] instagram: {len(result.get('slides', []))} slide(s) generated")
         else:
             posts = producer.generate_posts(
-                argument, platform, framework_context, source_url=source
+                cleared, platform, framework_context, source_url=source
             )
             posts_by_platform[platform] = posts
             print(f"[cli] {platform}: {len(posts)} post(s) generated")
 
     today = date.today().isoformat()
-    return producer.format_output(piece_title, argument, posts_by_platform, today)
+    return producer.format_output(
+        piece_title, argument, review, cleared, posts_by_platform, today
+    )
 
 
 def write_output(path: str, content: str) -> None:
